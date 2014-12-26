@@ -226,6 +226,24 @@ func main() {
 	srcIP, _ := net.ResolveIPAddr("ip4", "10.12.0.1")
 	dstIP, _ := net.ResolveIPAddr("ip4", destIP)
 
+	_, err := DialTeaCP(srcIP, dstIP, 8080)
+	if err != nil {
+		log.Fatalln("Error while dialing TeaCP connection ", err)
+	}
+}
+
+func main2() {
+	if len(os.Args) < 2 {
+		log.Fatalln("Usage : sudo TeaCP <dest address> <port>")
+	}
+	destIP := os.Args[1]
+	port, _ := strconv.Atoi(os.Args[2])
+	destPort := uint16(port)
+	fmt.Println("Use", destIP, destPort)
+
+	srcIP, _ := net.ResolveIPAddr("ip4", "10.12.0.1")
+	dstIP, _ := net.ResolveIPAddr("ip4", destIP)
+
 	sourcePort := uint16(55897)
 
 	conn := NewTunIPConn(srcIP, dstIP)

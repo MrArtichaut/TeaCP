@@ -22,8 +22,13 @@ type TeaCPConn struct {
 	seqNumber     uint32
 	nextRemoteSeq uint32
 
+	nextAckToSend uint32
+
 	toAckQueue       []*TCPPacket
 	toAckQueueLocker sync.Mutex
+
+	rcvBuffer     []*TCPPacket
+	oooRcvPackets []*TCPPacket //Out of Order packets
 
 	buffer        bytes.Buffer
 	buffReadCond  *sync.Cond
@@ -55,7 +60,7 @@ func (t *TeaCPConn) open() error {
 	}
 
 	fmt.Println("Interface opened. Pause while setup.")
-	fmt.Println("Try: sudo ifconfig tun12 10.12.0.2 10.12.0.1")
+	fmt.Println("Try: sudo ifconfig tun11 10.12.0.2 10.12.0.1")
 	fmt.Print("Press 'Enter' to continue...")
 	bufio.NewReader(os.Stdin).ReadBytes('\n')
 	fmt.Println("GO !")
@@ -94,7 +99,7 @@ func (t *TeaCPConn) open() error {
 	fmt.Println("TCP Packet")
 	fmt.Println(responseTcp.String())
 
-	if !responseTcp.HasFlag(FlagSYN) || responseTcp.HasFlag(FlagACK) {
+	if !(responseTcp.HasFlag(FlagSYN) && responseTcp.HasFlag(FlagACK)) {
 		return errors.New("Connection refused")
 	}
 
@@ -128,7 +133,7 @@ func (t *TeaCPConn) open() error {
 	return nil
 }
 
-func (t *TeaCPConn) consumePackects() {
+func (t *TeaCPConn) receivePackects() {
 	windowSize := 65535
 
 	b := make([]byte, 65535)
@@ -150,11 +155,44 @@ func (t *TeaCPConn) consumePackects() {
 		}
 
 		if packet.SeqNum < t.nextRemoteSeq {
-			continue // duplicate. Drop it
+			continue // duplicate packet. Drop it
 		}
 
-		t.toAckQueue = append(t.toAckQueue, packet)
+		if packet.HasFlag(FlagACK) {
+			//TODO
+			if len(packet.Data) == 0 {
+				continue //Just an ACK packet, no reason to keep it
+			}
+		}
 
+		if packet.SeqNum > t.nextRemoteSeq {
+			t.oooRcvPackets = append(t.oooRcvPackets, packet) //TODO check rcv + ooo size first
+			continue
+		}
+
+		t.rcvBuffer = append(t.rcvBuffer, packet)
+		t.nextRemoteSeq = t.nextRemoteSeq + uint32(len(packet.Data))
+
+		if len(t.oooRcvPackets) > 0 {
+			index := 0
+			for {
+				if index >= len(t.oooRcvPackets) {
+					break
+				}
+
+				ooopacket := t.oooRcvPackets[index]
+				if ooopacket.SeqNum == t.nextRemoteSeq {
+					t.rcvBuffer = append(t.rcvBuffer, ooopacket)
+					t.nextRemoteSeq = t.nextRemoteSeq + uint32(len(ooopacket.Data))
+					t.oooRcvPackets = append(t.oooRcvPackets[:index], t.oooRcvPackets[index+1:]...)
+					index = 0
+				} else {
+					index++
+				}
+			}
+		}
+
+		//This is a mess
 		t.buffWriteCond.L.Lock()
 		if (windowSize - t.buffer.Len()) < n {
 			//Not enought space in buffer. Wait
