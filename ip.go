@@ -229,7 +229,7 @@ func (c *TunIPConn) LocalAddr() net.IPAddr {
 }
 
 func (c *TunIPConn) Open() error {
-	file, err := os.OpenFile("/dev/tun11", os.O_RDWR, 0)
+	file, err := os.OpenFile("/dev/tun11", os.O_RDWR, os.ModeCharDevice)
 	if err != nil {
 		return err
 	}

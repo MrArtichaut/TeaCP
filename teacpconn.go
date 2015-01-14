@@ -8,31 +8,29 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"sort"
 	"sync"
 	"time"
 )
 
 type TeaCPConn struct {
-	ipConn        *TunIPConn
-	localIPAddr   *net.IPAddr
-	remoteIPAddr  *net.IPAddr
-	destPort      uint16
-	sourcePort    uint16
-	seqNumber     uint32
-	nextRemoteSeq uint32
+	ipConn          *TunIPConn
+	localIPAddr     *net.IPAddr
+	remoteIPAddr    *net.IPAddr
+	destPort        uint16
+	sourcePort      uint16
+	localSeqNumber  uint32
+	remoteSeqNumber uint32
 
-	nextAckToSend uint32
+	lastSentAck     uint32
+	lastReceivedAck uint32
 
-	toAckQueue       []*TCPPacket
-	toAckQueueLocker sync.Mutex
+	sendBuffer       [][]byte
+	sendCond         *sync.Cond
+	ackWaitingBuffer []*TCPPacket
 
-	rcvBuffer     []*TCPPacket
+	rcvBuffer     *bytes.Buffer
 	oooRcvPackets []*TCPPacket //Out of Order packets
-
-	buffer        bytes.Buffer
-	buffReadCond  *sync.Cond
-	buffWriteCond *sync.Cond
+	rcvBufferCon  *sync.Cond
 }
 
 func DialTeaCP(localAddr, remoteAddr *net.IPAddr, destPort int) (*TeaCPConn, error) {
@@ -123,21 +121,86 @@ func (t *TeaCPConn) open() error {
 	}
 	fmt.Printf("%d bytes sent (TCP Seq:%d, Ack:%d)\n", length, packet.SeqNum, packet.AckNum)
 
-	t.nextRemoteSeq = packet.AckNum
-	t.seqNumber = packet.SeqNum
+	t.remoteSeqNumber = packet.AckNum
+	t.localSeqNumber = packet.SeqNum
+	t.lastSentAck = packet.AckNum
+	t.lastReceivedAck = t.localSeqNumber
+	t.ackWaitingBuffer = make([]*TCPPacket, 10)
+	t.rcvBuffer = new(bytes.Buffer)
+	t.sendCond = sync.NewCond(new(sync.Mutex))
+	t.rcvBufferCon = sync.NewCond(new(sync.Mutex))
 
-	t.buffReadCond = sync.NewCond(new(sync.Mutex))
-	t.buffWriteCond = sync.NewCond(new(sync.Mutex))
-	t.buffer = bytes.Buffer{}
+	go t.packerSender()
+	go t.packetsReceiver()
 
 	return nil
 }
 
-func (t *TeaCPConn) receivePackects() {
-	windowSize := 65535
+func (t *TeaCPConn) packerSender() {
+	localIp, remotetIp := t.localIPAddr.String(), t.remoteIPAddr.String()
+
+	fmt.Println("O: packet sender started")
+	for {
+		t.sendCond.L.Lock()
+		var flags uint16
+		var payload []byte
+
+		for {
+			if t.remoteSeqNumber > t.lastSentAck {
+				fmt.Println("O: remote seq num incremented. Send ack")
+				flags = (1 << FlagACK)
+				break
+			} else if len(t.sendBuffer) > 0 {
+				payload, t.sendBuffer = t.sendBuffer[len(t.sendBuffer)-1], t.sendBuffer[:len(t.sendBuffer)-1]
+				break
+			}
+			t.sendCond.Wait()
+		}
+		t.sendCond.L.Unlock()
+
+		p := t.sendPacket(flags, payload, localIp, remotetIp)
+		fmt.Println("O: Packet sent")
+		fmt.Println(p)
+	}
+}
+
+func (t *TeaCPConn) sendPacket(flags uint16, payload []byte, localIp, remotetIp string) *TCPPacket {
+	packet := &TCPPacket{}
+	packet.SrcPort = t.sourcePort
+	packet.DestPort = t.destPort
+	packet.DataOffset = uint8(5)
+	packet.SeqNum = t.localSeqNumber
+	packet.AckNum = t.remoteSeqNumber
+	packet.WindowSize = uint16(4096 * 8)
+
+	packet.Flags = flags
+	packet.Data = payload
+
+	b := packet.Marshall(localIp, remotetIp)
+	_, err := t.ipConn.Write(b)
+	if err != nil {
+		fmt.Println("Failed to send packet with seq", t.localSeqNumber, " due to error: ", err)
+		//What to do ?
+	} else {
+		//start timeout timer
+		if packet.HasFlag(FlagACK) {
+			t.lastSentAck = packet.AckNum
+		}
+
+		if packet.Data != nil {
+			t.localSeqNumber = t.localSeqNumber + uint32(len(packet.Data))
+		}
+	}
+
+	return packet
+}
+
+func (t *TeaCPConn) packetsReceiver() {
+	//windowSize := 65535
 
 	b := make([]byte, 65535)
 
+	fmt.Println("I: packet sender started")
 	for {
 		n, err := t.ipConn.Read(b)
 		if err != nil {
@@ -145,80 +208,83 @@ func (t *TeaCPConn) receivePackects() {
 			fmt.Println("IP Read error", err)
 			continue
 		}
+		fmt.Println("I: ", n, "bytes read from ip connection")
 
 		packet := NewTCPPacket(b)
+		fmt.Println("I: New packet received")
+		fmt.Println(packet)
 
 		if packet.HasFlag(FlagRST) {
+			fmt.Println("I: RST flag received")
 			//Clear buffer
 			//Send ACK + RST
 			return
 		}
 
-		if packet.SeqNum < t.nextRemoteSeq {
+		if packet.SeqNum < t.remoteSeqNumber {
+			fmt.Println("I: Duplicate package. Retransmission ?")
 			continue // duplicate packet. Drop it
 		}
 
 		if packet.HasFlag(FlagACK) {
-			//TODO
-			if len(packet.Data) == 0 {
-				continue //Just an ACK packet, no reason to keep it
-			}
+			fmt.Println("I: ACK flag received")
+			//var clean []*TCPPacket
+			//for index, p := range t.ackWaitingBuffer {
+			//	if (p.SeqNum + uint32(len(packet.Data))) > packet.AckNum {
+			//		clean = append(clean, p)
+			//	}
+			//}
+			//t.ackWaitingBuffer = clean
+
+			////TODO
+			//if len(packet.Data) == 0 {
+			//	continue //Just an ACK packet, no reason to keep it
+			//}
 		}
 
-		if packet.SeqNum > t.nextRemoteSeq {
-			t.oooRcvPackets = append(t.oooRcvPackets, packet) //TODO check rcv + ooo size first
+		if packet.SeqNum > t.remoteSeqNumber {
+			fmt.Println("I: Out of order packet")
+			//t.oooRcvPackets = append(t.oooRcvPackets, packet) //TODO check rcv + ooo size first
 			continue
 		}
 
-		t.rcvBuffer = append(t.rcvBuffer, packet)
-		t.nextRemoteSeq = t.nextRemoteSeq + uint32(len(packet.Data))
-
-		if len(t.oooRcvPackets) > 0 {
-			index := 0
-			for {
-				if index >= len(t.oooRcvPackets) {
-					break
-				}
-
-				ooopacket := t.oooRcvPackets[index]
-				if ooopacket.SeqNum == t.nextRemoteSeq {
-					t.rcvBuffer = append(t.rcvBuffer, ooopacket)
-					t.nextRemoteSeq = t.nextRemoteSeq + uint32(len(ooopacket.Data))
-					t.oooRcvPackets = append(t.oooRcvPackets[:index], t.oooRcvPackets[index+1:]...)
-					index = 0
-				} else {
-					index++
-				}
-			}
+		t.rcvBufferCon.L.Lock()
+		l, err := t.rcvBuffer.Write(packet.Data)
+		if err != nil {
+			fmt.Println("I: Error while writing packet data into buffer")
+		} else {
+			fmt.Println("I: ", l, "bytes writed into rcvBuffer")
+			t.rcvBufferCon.Signal()
 		}
+		t.rcvBufferCon.L.Unlock()
 
-		//This is a mess
-		t.buffWriteCond.L.Lock()
-		if (windowSize - t.buffer.Len()) < n {
-			//Not enought space in buffer. Wait
-			t.buffWriteCond.Wait()
-		}
-		t.buffWriteCond.L.Unlock()
+		t.sendCond.L.Lock()
+		t.remoteSeqNumber = t.remoteSeqNumber + uint32(len(packet.Data))
+		fmt.Println("I: new remote seq num", t.remoteSeqNumber)
+		t.sendCond.Signal() //signal that new ack should be send
+		t.sendCond.L.Unlock()
 
-		t.buffReadCond.L.Lock()
-		t.buffer.Write(b[:n])
-		fmt.Println(n, "bytes written in TCP buffer")
-		t.buffReadCond.Signal()
-		t.buffReadCond.L.Unlock()
+		//if len(t.oooRcvPackets) > 0 {
+		//	index := 0
+		//	for {
+		//		if index >= len(t.oooRcvPackets) {
+		//			break
+		//		}
+
+		//		ooopacket := t.oooRcvPackets[index]
+		//		if ooopacket.SeqNum == t.remoteSeqNumber {
+		//			t.rcvBuffer = append(t.rcvBuffer, ooopacket)
+		//			t.remoteSeqNumber = t.remoteSeqNumber + uint32(len(ooopacket.Data))
+		//			t.oooRcvPackets = append(t.oooRcvPackets[:index], t.oooRcvPackets[index+1:]...)
+		//			index = 0
+		//		} else {
+		//			index++
+		//		}
+		//	}
+		//}
+
 	}
 
-}
-
-type SortBySeq []*TCPPacket
-
-func (a SortBySeq) Len() int {
-	return len(a)
-}
-func (a SortBySeq) Swap(i, j int) {
-	a[i], a[j] = a[j], a[i]
-}
-func (a SortBySeq) Less(i, j int) bool {
-	return a[i].SeqNum < a[j].SeqNum
 }
 
 // func sortQueue(q *list.List) {
@@ -239,56 +305,18 @@ func (a SortBySeq) Less(i, j int) bool {
 //  }
 // }
 
-func (t *TeaCPConn) ackPackets() {
-	t.toAckQueueLocker.Lock()
-	defer t.toAckQueueLocker.Unlock()
-
-	if len(t.toAckQueue) == 0 {
-		return
-	}
-
-	sort.Sort(SortBySeq(t.toAckQueue))
-
-	var packetToAck *TCPPacket = t.toAckQueue[0]
-
-	if packetToAck.SeqNum != t.nextRemoteSeq {
-		//missing packet. Ack nothing (improvement : selective ACK)
-		//clear toAckQueue
-	}
-
-	for i, p := range t.toAckQueue {
-		expected := packetToAck.SeqNum
-		if packetToAck.Data != nil {
-			expected += uint32(len(packetToAck.Data))
-		}
-
-		if expected != p.SeqNum {
-			//wrong sequence number (missing packet)
-			t.toAckQueue = t.toAckQueue[:i]
-			break
-		}
-		packetToAck = p
-	}
-
-	ackNumber := packetToAck.SeqNum
-	if packetToAck.Data != nil {
-		ackNumber += uint32(len(packetToAck.Data))
-	}
-
-}
-
 func (t *TeaCPConn) Close() {
 
 }
 
 func (t *TeaCPConn) Read(b []byte) (n int, err error) {
-	t.buffReadCond.L.Lock()
-	if t.buffer.Len() == 0 {
-		t.buffReadCond.Wait()
+	t.rcvBufferCon.L.Lock()
+	if t.rcvBuffer.Len() == 0 {
+		t.rcvBufferCon.Wait()
 	}
 
-	n, err = t.buffer.Read(b)
-	t.buffReadCond.L.Unlock()
+	n, err = t.rcvBuffer.Read(b)
+	t.rcvBufferCon.L.Unlock()
 
 	return n, err
 }
